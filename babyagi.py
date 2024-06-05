@@ -10,7 +10,7 @@ import logging
 from collections import deque
 from typing import Dict, List
 import importlib
-import openai
+from openai import OpenAI
 import chromadb
 import tiktoken as tiktoken
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
@@ -27,9 +27,10 @@ client = chromadb.Client(Settings(anonymized_telemetry=False))
 # Model: GPT, LLAMA, HUMAN, etc.
 LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")).lower()
 
-# API Keys
+# API Keys and base url
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-if not (LLM_MODEL.startswith("llama") or LLM_MODEL.startswith("human")):
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")
+if not (LLM_MODEL.startswith("llama-") or LLM_MODEL.startswith("human")):
     assert OPENAI_API_KEY, "\033[91m\033[1m" + "OPENAI_API_KEY environment variable is missing from .env" + "\033[0m\033[0m"
 
 # Table config
@@ -104,7 +105,7 @@ assert OBJECTIVE, "\033[91m\033[1m" + "OBJECTIVE environment variable is missing
 assert INITIAL_TASK, "\033[91m\033[1m" + "INITIAL_TASK environment variable is missing from .env" + "\033[0m\033[0m"
 
 LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "models/llama-13B/ggml-model.bin")
-if LLM_MODEL.startswith("llama"):
+if LLM_MODEL.startswith("llama-"):
     if can_import("llama_cpp"):
         from llama_cpp import Llama
 
@@ -168,10 +169,6 @@ if not JOIN_EXISTING_OBJECTIVE:
 else:
     print("\033[93m\033[1m" + f"\nJoining to help the objective" + "\033[0m\033[0m")
 
-# Configure OpenAI
-openai.api_key = OPENAI_API_KEY
-
-
 # Llama embedding function
 class LlamaEmbeddingFunction(EmbeddingFunction):
     def __init__(self):
@@ -199,10 +196,10 @@ class DefaultResultsStorage:
         )
 
         metric = "cosine"
-        if LLM_MODEL.startswith("llama"):
+        if LLM_MODEL.startswith("llama-"):
             embedding_function = LlamaEmbeddingFunction()
         else:
-            embedding_function = OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY)
+            embedding_function = OpenAIEmbeddingFunction(api_base=OPENAI_API_BASE,api_key=OPENAI_API_KEY)
         self.collection = chroma_client.get_or_create_collection(
             name=RESULTS_STORE_NAME,
             metadata={"hnsw:space": metric},
@@ -216,7 +213,7 @@ class DefaultResultsStorage:
             return
         # Continue with the rest of the function
 
-        embeddings = llm_embed.embed(result) if LLM_MODEL.startswith("llama") else None
+        embeddings = llm_embed.embed(result) if LLM_MODEL.startswith("llama-") else None
         if (
                 len(self.collection.get(ids=[result_id], include=[])["ids"]) > 0
         ):  # Check if the result already exists
@@ -329,6 +326,7 @@ def limit_tokens_from_string(string: str, model: str, limit: int) -> str:
 
     return encoding.decode(encoded[:limit])
 
+client = OpenAI(base_url=OPENAI_API_BASE,api_key=OPENAI_API_KEY)
 
 def openai_call(
     prompt: str,
@@ -336,84 +334,17 @@ def openai_call(
     temperature: float = OPENAI_TEMPERATURE,
     max_tokens: int = 100,
 ):
-    while True:
-        try:
-            if model.lower().startswith("llama"):
-                result = llm(prompt[:CTX_MAX],
-                             stop=["### Human"],
-                             echo=False,
-                             temperature=0.2,
-                             top_k=40,
-                             top_p=0.95,
-                             repeat_penalty=1.05,
-                             max_tokens=200)
-                # print('\n*****RESULT JSON DUMP*****\n')
-                # print(json.dumps(result))
-                # print('\n')
-                return result['choices'][0]['text'].strip()
-            elif model.lower().startswith("human"):
-                return user_input_await(prompt)
-            elif not model.lower().startswith("gpt-"):
-                # Use completion API
-                response = openai.Completion.create(
-                    engine=model,
-                    prompt=prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                )
-                return response.choices[0].text.strip()
-            else:
-                # Use 4000 instead of the real limit (4097) to give a bit of wiggle room for the encoding of roles.
-                # TODO: different limits for different models.
-
-                trimmed_prompt = limit_tokens_from_string(prompt, model, 4000 - max_tokens)
-
-                # Use chat completion API
-                messages = [{"role": "system", "content": trimmed_prompt}]
-                response = openai.ChatCompletion.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    n=1,
-                    stop=None,
-                )
-                return response.choices[0].message.content.strip()
-        except openai.error.RateLimitError:
-            print(
-                "   *** The OpenAI API rate limit has been exceeded. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.Timeout:
-            print(
-                "   *** OpenAI API timeout occurred. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.APIError:
-            print(
-                "   *** OpenAI API error occurred. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.APIConnectionError:
-            print(
-                "   *** OpenAI API connection error occurred. Check your network settings, proxy configuration, SSL certificates, or firewall rules. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.InvalidRequestError:
-            print(
-                "   *** OpenAI API invalid request. Check the documentation for the specific API method you are calling and make sure you are sending valid and complete parameters. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.ServiceUnavailableError:
-            print(
-                "   *** OpenAI API service unavailable. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        else:
-            break
+    prompt = limit_tokens_from_string(prompt, model, 4000 - max_tokens)
+    messages = [{"role": "system", "content": prompt}]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        n=1,
+        stop=None,
+    )
+    return response.choices[0].message.content.strip()
 
 
 def task_creation_agent(
@@ -437,7 +368,7 @@ Return one task per line in your response. The result must be a numbered list in
 #. Second task
 
 The number of each entry must be followed by a period. If your list is empty, write "There are no tasks to add at this time."
-Unless your list is empty, do not include any headers before your numbered list or follow your numbered list with any other output."""
+Unless your list is empty, do not include any headers before your numbered list or follow your numbered list with any other output. OUTPUT IN CHINESE"""
 
     print(f'\n*****TASK CREATION AGENT PROMPT****\n{prompt}\n')
     response = openai_call(prompt, max_tokens=2000)
@@ -471,7 +402,7 @@ Do not remove any tasks. Return the ranked tasks as a numbered list in the forma
 #. Second task
 
 The entries must be consecutively numbered, starting with 1. The number of each entry must be followed by a period.
-Do not include any headers before your ranked list or follow your list with any other output."""
+Do not include any headers before your ranked list or follow your list with any other output. OUTPUT IN CHINESE"""
 
     print(f'\n****TASK PRIORITIZATION AGENT PROMPT****\n{prompt}\n')
     response = openai_call(prompt, max_tokens=2000)
@@ -510,7 +441,7 @@ def execution_agent(objective: str, task: str) -> str:
     # print("\n****RELEVANT CONTEXT****\n")
     # print(context)
     # print('')
-    prompt = f'Perform one task based on the following objective: {objective}.\n'
+    prompt = f'OUTPUT IN CHINESE. Perform one task based on the following objective: {objective}.\n'
     if context:
         prompt += 'Take into account these previously completed tasks:' + '\n'.join(context)
     prompt += f'\nYour task: {task}\nResponse:'
